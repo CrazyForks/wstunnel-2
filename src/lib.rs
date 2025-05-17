@@ -22,7 +22,6 @@ use crate::tunnel::server::{TlsServerConfig, WsServer, WsServerConfig};
 use crate::tunnel::transport::{TransportAddr, TransportScheme};
 use crate::tunnel::{RemoteAddr, to_host_port};
 use anyhow::{Context, anyhow};
-use futures_util::future::join_all;
 use hyper::header::HOST;
 use hyper::http::HeaderValue;
 use log::debug;
@@ -31,6 +30,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
+use tokio::task::JoinSet;
 use tracing::{error, info};
 use url::Url;
 
@@ -136,14 +136,14 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
     info!("Starting wstunnel client v{}", env!("CARGO_PKG_VERSION"),);
 
     // Keep track of all spawned tunnels
-    let mut spawned_tunnels = Vec::new();
+    let mut spawned_tunnels = JoinSet::new();
 
     // Start tunnels
     for tunnel in args.remote_to_local.into_iter() {
         let client = client.clone();
         match &tunnel.local_protocol {
             LocalProtocol::ReverseTcp => {
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     let cfg = client.config.clone();
                     let tcp_connector = TcpTunnelConnector::new(
                         &tunnel.remote.0,
@@ -161,12 +161,12 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
                     if let Err(err) = client.run_reverse_tunnel(remote, tcp_connector).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::ReverseUdp { timeout } => {
                 let timeout = *timeout;
 
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     let cfg = client.config.clone();
                     let (host, port) = to_host_port(tunnel.local);
                     let remote = RemoteAddr {
@@ -185,12 +185,12 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
                     if let Err(err) = client.run_reverse_tunnel(remote.clone(), udp_connector).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::ReverseSocks5 { timeout, credentials } => {
                 let credentials = credentials.clone();
                 let timeout = *timeout;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     let cfg = client.config.clone();
                     let (host, port) = to_host_port(tunnel.local);
                     let remote = RemoteAddr {
@@ -204,12 +204,12 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
                     if let Err(err) = client.run_reverse_tunnel(remote, socks_connector).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::ReverseHttpProxy { timeout, credentials } => {
                 let credentials = credentials.clone();
                 let timeout = *timeout;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     let cfg = client.config.clone();
                     let (host, port) = to_host_port(tunnel.local);
                     let remote = RemoteAddr {
@@ -228,11 +228,11 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
                     if let Err(err) = client.run_reverse_tunnel(remote, tcp_connector).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::ReverseUnix { path } => {
                 let path = path.clone();
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     let cfg = client.config.clone();
                     let tcp_connector = TcpTunnelConnector::new(
                         &tunnel.remote.0,
@@ -251,7 +251,7 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
                     if let Err(err) = client.run_reverse_tunnel(remote, tcp_connector).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::Stdio { .. }
             | LocalProtocol::TProxyTcp
@@ -272,32 +272,32 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
         match &tunnel.local_protocol {
             LocalProtocol::Tcp { proxy_protocol } => {
                 let server = TcpTunnelListener::new(tunnel.local, tunnel.remote.clone(), *proxy_protocol).await?;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             #[cfg(target_os = "linux")]
             LocalProtocol::TProxyTcp => {
                 use crate::tunnel::listeners::TproxyTcpTunnelListener;
                 let server = TproxyTcpTunnelListener::new(tunnel.local, false).await?;
 
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             #[cfg(unix)]
             LocalProtocol::Unix { path, proxy_protocol } => {
                 use crate::tunnel::listeners::UnixTunnelListener;
                 let server = UnixTunnelListener::new(path, tunnel.remote.clone(), *proxy_protocol).await?;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             #[cfg(not(unix))]
             LocalProtocol::Unix { .. } => {
@@ -308,11 +308,11 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
             LocalProtocol::TProxyUdp { timeout } => {
                 use crate::tunnel::listeners::new_tproxy_udp;
                 let server = new_tproxy_udp(tunnel.local, *timeout).await?;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             #[cfg(not(target_os = "linux"))]
             LocalProtocol::TProxyTcp | LocalProtocol::TProxyUdp { .. } => {
@@ -321,19 +321,19 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
             LocalProtocol::Udp { timeout } => {
                 let server = UdpTunnelListener::new(tunnel.local, tunnel.remote.clone(), *timeout).await?;
 
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::Socks5 { timeout, credentials } => {
                 let server = Socks5TunnelListener::new(tunnel.local, *timeout, credentials.clone()).await?;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
             LocalProtocol::HttpProxy {
                 timeout,
@@ -342,16 +342,16 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
             } => {
                 let server =
                     HttpProxyTunnelListener::new(tunnel.local, *timeout, credentials.clone(), *proxy_protocol).await?;
-                spawned_tunnels.push(tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
-                }));
+                });
             }
 
             LocalProtocol::Stdio { proxy_protocol } => {
                 let (server, mut handle) = new_stdio_listener(tunnel.remote.clone(), *proxy_protocol).await?;
-                tokio::spawn(async move {
+                spawned_tunnels.spawn(async move {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
                     }
@@ -375,7 +375,7 @@ pub async fn run_client(args: Client) -> anyhow::Result<()> {
     }
 
     // wait for all tunnels to complete
-    join_all(spawned_tunnels).await;
+    spawned_tunnels.join_all().await;
     Ok(())
 }
 
@@ -428,12 +428,11 @@ pub async fn run_server(args: Server) -> anyhow::Result<()> {
             })
             .collect();
 
-        let restriction_cfg = RestrictionsRules::from_path_prefix(
+        RestrictionsRules::from_path_prefix(
             args.restrict_http_upgrade_path_prefix.as_deref().unwrap_or(&[]),
             &restrict_to,
         )
-        .expect("Cannot convert restriction rules from path-prefix and restric-to");
-        restriction_cfg
+        .expect("Cannot convert restriction rules from path-prefix and restric-to")
     };
 
     let http_proxy = mk_http_proxy(args.http_proxy, args.http_proxy_login, args.http_proxy_password)?;

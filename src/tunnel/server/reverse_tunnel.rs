@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::{select, time};
 use tracing::{Instrument, Span, info};
 
@@ -17,14 +18,22 @@ struct ReverseTunnelItem<T: TunnelListener> {
     #[allow(clippy::type_complexity)]
     receiver: async_channel::Receiver<((<T as TunnelListener>::Reader, <T as TunnelListener>::Writer), RemoteAddr)>,
     nb_seen_clients: Arc<AtomicUsize>,
+    server_task: JoinHandle<()>,
 }
 
-impl<T: TunnelListener> Clone for ReverseTunnelItem<T> {
-    fn clone(&self) -> Self {
-        Self {
-            receiver: self.receiver.clone(),
-            nb_seen_clients: self.nb_seen_clients.clone(),
-        }
+impl<T: TunnelListener> ReverseTunnelItem<T> {
+    #[allow(clippy::type_complexity)]
+    pub fn get_cnx_awaiter(
+        &self,
+    ) -> async_channel::Receiver<((<T as TunnelListener>::Reader, <T as TunnelListener>::Writer), RemoteAddr)> {
+        self.nb_seen_clients.fetch_add(1, Ordering::Relaxed);
+        self.receiver.clone()
+    }
+}
+
+impl<T: TunnelListener> Drop for ReverseTunnelItem<T> {
+    fn drop(&mut self) {
+        self.server_task.abort();
     }
 }
 
@@ -48,8 +57,12 @@ impl<T: TunnelListener> ReverseTunnelServer<T> {
     where
         T: TunnelListener + Send + 'static,
     {
-        let listening_server = self.servers.lock().get(&bind_addr).cloned();
-        let item = if let Some(listening_server) = listening_server {
+        let listening_server = self
+            .servers
+            .lock()
+            .get(&bind_addr)
+            .map(|server| server.get_cnx_awaiter());
+        let cnx = if let Some(listening_server) = listening_server {
             listening_server
         } else {
             let listening_server = gen_listening_server.await?;
@@ -98,18 +111,17 @@ impl<T: TunnelListener> ReverseTunnelServer<T> {
                 info!("Stopping listening reverse server");
             };
 
-            tokio::spawn(fut.instrument(Span::current()));
             let item = ReverseTunnelItem {
                 receiver: rx,
                 nb_seen_clients,
+                server_task: tokio::spawn(fut.instrument(Span::current())),
             };
-            self.servers.lock().insert(bind_addr, item.clone());
-            item
+            let cnx_awaiter = item.get_cnx_awaiter();
+            self.servers.lock().insert(bind_addr, item);
+            cnx_awaiter
         };
 
-        item.nb_seen_clients.fetch_add(1, Ordering::Relaxed);
-        let cnx = item
-            .receiver
+        let cnx = cnx
             .recv()
             .await
             .map_err(|_| anyhow!("listening reverse server stopped"))?;

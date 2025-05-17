@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{Instrument, Level, Span, error, event, span};
 use url::Host;
@@ -101,6 +102,8 @@ impl WsClient {
 
     pub async fn run_tunnel(self, tunnel_listener: impl TunnelListener) -> anyhow::Result<()> {
         pin_mut!(tunnel_listener);
+        let mut spawned_tunnels = JoinSet::new();
+
         while let Some(cnx) = tunnel_listener.next().await {
             let (cnx_stream, remote_addr) = match cnx {
                 Ok((cnx_stream, remote_addr)) => (cnx_stream, remote_addr),
@@ -126,7 +129,7 @@ impl WsClient {
             }
             .instrument(span);
 
-            tokio::spawn(tunnel);
+            spawned_tunnels.spawn(tunnel);
         }
 
         Ok(())
@@ -147,6 +150,7 @@ impl WsClient {
             }
         }
 
+        let mut spawned_tunnels = JoinSet::new();
         let mut reconnect_delay = new_reconnect_delay(self.reverse_tunnel_connection_retry_max_backoff);
         loop {
             let client = self.clone();
@@ -223,7 +227,7 @@ impl WsClient {
                 let _ = super::super::transport::io::propagate_remote_to_local(local_tx, ws_rx, close_rx).await;
             }
             .instrument(span.clone());
-            tokio::spawn(tunnel);
+            spawned_tunnels.spawn(tunnel);
         }
     }
 }
